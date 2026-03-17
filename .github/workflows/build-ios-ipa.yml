@@ -54,7 +54,24 @@ jobs:
           OPENCLAW_SHARE_PROFILE =
           XCCONFIG
 
-      - name: Generate Xcode project
+      - name: Strip watch targets from project.yml
+        working-directory: apps/ios
+        run: |
+          # The CI runner lacks the watchOS SDK, so remove watch targets
+          # and the watch dependency from the main app before generating.
+          python3 - <<'PYEOF'
+          import re, pathlib
+          p = pathlib.Path("project.yml")
+          text = p.read_text()
+          # Remove OpenClawWatchApp and OpenClawWatchExtension target blocks
+          text = re.sub(r'\n  OpenClawWatchApp:.*?(?=\n  \w|\Z)', '', text, flags=re.DOTALL)
+          text = re.sub(r'\n  OpenClawWatchExtension:.*?(?=\n  \w|\Z)', '', text, flags=re.DOTALL)
+          # Remove watch dependency from OpenClaw target
+          text = re.sub(r'\s*- target: OpenClawWatchApp\n', '\n', text)
+          p.write_text(text)
+          PYEOF
+
+      - name: Regenerate Xcode project (no watch)
         working-directory: apps/ios
         run: xcodegen generate
 
@@ -67,6 +84,7 @@ jobs:
             -sdk iphoneos \
             -configuration ${{ inputs.configuration || 'Release' }} \
             -destination generic/platform=iOS \
+            -skipUnavailableActions \
             CODE_SIGN_IDENTITY="-" \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO \
