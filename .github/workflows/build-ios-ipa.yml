@@ -1,0 +1,106 @@
+name: build-ios-ipa
+
+on:
+  workflow_dispatch:
+    inputs:
+      configuration:
+        description: "Build configuration"
+        required: false
+        default: "Release"
+        type: choice
+        options:
+          - Release
+          - Debug
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: brew install xcodegen swiftformat swiftlint
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+
+      - name: Install JS deps
+        run: pnpm install --frozen-lockfile
+
+      - name: Configure signing (ad-hoc for Signulous re-sign)
+        run: |
+          cat > apps/ios/.local-signing.xcconfig <<'XCCONFIG'
+          OPENCLAW_CODE_SIGN_STYLE = Manual
+          OPENCLAW_DEVELOPMENT_TEAM =
+          OPENCLAW_APP_BUNDLE_ID = ai.openclaw.client
+          OPENCLAW_SHARE_BUNDLE_ID = ai.openclaw.client.share
+          OPENCLAW_ACTIVITY_WIDGET_BUNDLE_ID = ai.openclaw.client.activitywidget
+          OPENCLAW_WATCH_APP_BUNDLE_ID = ai.openclaw.client.watchkitapp
+          OPENCLAW_WATCH_EXTENSION_BUNDLE_ID = ai.openclaw.client.watchkitapp.extension
+          OPENCLAW_APP_PROFILE =
+          OPENCLAW_SHARE_PROFILE =
+          XCCONFIG
+
+      - name: Generate Xcode project
+        working-directory: apps/ios
+        run: xcodegen generate
+
+      - name: Archive
+        working-directory: apps/ios
+        run: |
+          xcodebuild archive \
+            -scheme OpenClaw \
+            -archivePath build/OpenClaw.xcarchive \
+            -sdk iphoneos \
+            -configuration ${{ inputs.configuration || 'Release' }} \
+            -destination generic/platform=iOS \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES \
+            DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE_SPECIFIER=""
+
+      - name: Export IPA
+        working-directory: apps/ios
+        run: |
+          # Create unsigned export options
+          cat > build/ExportOptions.plist <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>development</string>
+            <key>compileBitcode</key>
+            <false/>
+            <key>stripSwiftSymbols</key>
+            <true/>
+            <key>thinning</key>
+            <string>&lt;none&gt;</string>
+            <key>signingStyle</key>
+            <string>manual</string>
+          </dict>
+          </plist>
+          PLIST
+
+          # Package the .app from the archive into an IPA directly
+          mkdir -p build/ipa/Payload
+          cp -R build/OpenClaw.xcarchive/Products/Applications/OpenClaw.app build/ipa/Payload/
+          cd build/ipa
+          zip -r ../OpenClaw.ipa Payload
+          echo "IPA created at build/OpenClaw.ipa"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenClaw-${{ inputs.configuration || 'Release' }}
+          path: apps/ios/build/OpenClaw.ipa
+          retention-days: 30
