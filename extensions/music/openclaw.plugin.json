@@ -1,0 +1,31 @@
+{
+  "id": "music",
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "enabled": { "type": "boolean", "default": false },
+      "defaultBackend": { "type": "string", "enum": ["lavalink", "spotify"], "default": "lavalink" },
+      "lavalink": {
+        "type": "object",
+        "properties": {
+          "host": { "type": "string", "default": "localhost" },
+          "port": { "type": "number", "default": 2333 },
+          "password": { "type": "string" }
+        }
+      },
+      "spotify": {
+        "type": "object",
+        "properties": {
+          "clientId": { "type": "string" },
+          "clientSecret": { "type": "string" }
+        }
+      },
+      "spoticord": {
+        "type": "object",
+        "properties": {
+          "databaseUrl": { "type": "string" }
+        }
+      }
+    }
+  }
+}

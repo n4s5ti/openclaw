@@ -1,0 +1,14 @@
+{
+  "name": "@openclaw/music",
+  "version": "2026.3.14",
+  "description": "OpenClaw music control plugin — Lavalink + Spotify",
+  "type": "module",
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "dependencies": {
+    "@sinclair/typebox": "0.34.48"
+  }
+}

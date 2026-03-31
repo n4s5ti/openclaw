@@ -491,6 +491,20 @@ const DiscordVoiceAutoJoinSchema = z
   })
   .strict();
 
+const DiscordVoiceStreamingSchema = z
+  .object({
+    enabled: z.boolean().optional(),
+    sttModel: z.string().optional(),
+    silenceDurationMs: z.number().int().min(100).max(5000).optional(),
+    vadThreshold: z.number().min(0).max(1).optional(),
+    ttsModel: z.string().optional(),
+    ttsVoice: z.string().optional(),
+    ttsInstructions: z.string().optional(),
+    llmModel: z.string().optional(),
+  })
+  .strict()
+  .optional();
+
 const DiscordVoiceSchema = z
   .object({
     enabled: z.boolean().optional(),
@@ -498,6 +512,7 @@ const DiscordVoiceSchema = z
     daveEncryption: z.boolean().optional(),
     decryptionFailureTolerance: z.number().int().min(0).optional(),
     tts: TtsConfigSchema.optional(),
+    streaming: DiscordVoiceStreamingSchema,
   })
   .strict()
   .optional();

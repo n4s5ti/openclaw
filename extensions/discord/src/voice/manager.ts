@@ -88,6 +88,12 @@ type VoiceSessionEntry = {
   capture: VoiceCaptureState;
   receiveRecovery: VoiceReceiveRecoveryState;
   stop: () => void;
+  /** Streaming voice session (OpenAI Realtime API). Present when streaming mode is enabled. */
+  streamingSession?: DiscordStreamingSession;
+  /** Abort controller for current streaming TTS playback (for barge-in). */
+  streamingTtsAbort?: AbortController;
+  /** Cached plugin runtime for runEmbeddedPiAgent (captured at join time). */
+  pluginRuntime?: ReturnType<typeof getDiscordRuntime>;
 };
 
 function mergeTtsConfig(base: TtsConfig, override?: TtsConfig): TtsConfig {
@@ -536,6 +542,8 @@ export class DiscordVoiceManager {
         if (playerErrorHandler) {
           player.off("error", playerErrorHandler);
         }
+        void entry.streamingSession?.stop();
+        entry.streamingTtsAbort?.abort();
         player.stop();
         connection.destroy();
       },
@@ -578,6 +586,46 @@ export class DiscordVoiceManager {
     connection.on(voiceSdk.VoiceConnectionStatus.Disconnected, disconnectedHandler);
     connection.on(voiceSdk.VoiceConnectionStatus.Destroyed, destroyedHandler);
     player.on("error", playerErrorHandler);
+
+    // Initialize streaming session if streaming mode is enabled
+    const streamingCfg = this.params.discordConfig.voice?.streaming;
+    if (streamingCfg?.enabled) {
+      const openaiApiKey = await this.resolveOpenAIApiKey();
+      if (openaiApiKey) {
+        const session = new DiscordStreamingSession({
+          openaiApiKey,
+          sttModel: streamingCfg.sttModel,
+          silenceDurationMs: streamingCfg.silenceDurationMs,
+          vadThreshold: streamingCfg.vadThreshold,
+        });
+
+        session.onSpeechStart(() => {
+          // Barge-in: stop current TTS playback
+          if (entry.player.state.status === AudioPlayerStatus.Playing) {
+            entry.player.stop(true);
+          }
+          entry.streamingTtsAbort?.abort();
+        });
+
+        session.onTranscript((transcript) => {
+          if (!transcript.trim()) return;
+          this.enqueueProcessing(entry, async () => {
+            await this.processStreamingTranscript(entry, transcript);
+          });
+        });
+
+        try {
+          await session.start();
+          entry.streamingSession = session;
+          entry.pluginRuntime = getDiscordRuntime();
+          logger.info(`voice streaming: session started for guild ${guildId}`);
+        } catch (err) {
+          logger.warn(`discord voice: streaming session failed to start: ${formatErrorMessage(err)}, falling back to batch mode`);
+        }
+      } else {
+        logger.warn("discord voice: streaming enabled but no OpenAI API key available, falling back to batch mode");
+      }
+    }
 
     this.sessions.set(guildId, entry);
     return {
@@ -675,7 +723,57 @@ export class DiscordVoiceManager {
     if (entry.player.state.status === voiceSdk.AudioPlayerStatus.Playing) {
       entry.player.stop(true);
     }
+    entry.streamingTtsAbort?.abort();
 
+    // Streaming mode: decode each Opus frame and feed to STT session immediately.
+    // Transcripts arrive via the onTranscript callback wired in join().
+    if (entry.streamingSession?.isConnected()) {
+      const opusDecoder = createOpusDecoder();
+      if (!opusDecoder) {
+        entry.activeSpeakers.delete(userId);
+        return;
+      }
+
+      // Subscribe with Manual end behavior — we stream continuously, STT VAD handles turn detection
+      const stream = entry.connection.receiver.subscribe(userId, {
+        end: { behavior: EndBehaviorType.AfterSilence, duration: SILENCE_DURATION_MS },
+      });
+      stream.on("error", (err) => this.handleReceiveError(entry, err));
+
+      let frameCount = 0;
+      try {
+        for await (const chunk of stream) {
+          if (!chunk || !(chunk instanceof Buffer) || chunk.length === 0) continue;
+          const decoded = opusDecoder.decoder.decode(chunk);
+          if (decoded && decoded.length > 0) {
+            entry.streamingSession.feedAudio(Buffer.from(decoded));
+            frameCount++;
+          }
+        }
+        if (frameCount > 0) {
+          this.resetDecryptFailureState(entry);
+          // Feed silence so OpenAI Realtime VAD detects end-of-speech.
+          // Discord's AfterSilence ends the stream, but the Realtime API needs
+          // actual silence audio packets (not just "stream ended") to trigger speech_stopped.
+          const silenceFrame = Buffer.alloc(CHANNELS * 2 * Math.floor(SAMPLE_RATE * 0.02)); // 20ms silence at 48kHz stereo
+          for (let i = 0; i < 50; i++) { // 50 frames × 20ms = 1s of silence
+            entry.streamingSession?.feedAudio(silenceFrame);
+          }
+          logger.info(
+            `voice streaming: fed ${frameCount} frames + 50 silence frames guild=${entry.guildId} user=${userId}`,
+          );
+        }
+      } catch (err) {
+        if (shouldLogVerbose()) {
+          logVerbose(`discord voice: streaming decode failed: ${formatErrorMessage(err)}`);
+        }
+      } finally {
+        entry.activeSpeakers.delete(userId);
+      }
+      return;
+    }
+
+    // Batch mode (legacy): capture full segment → WAV → batch STT → agent → batch TTS
     const stream = entry.connection.receiver.subscribe(userId, {
       end: {
         behavior: voiceSdk.EndBehaviorType.Manual,
@@ -849,6 +947,133 @@ export class DiscordVoiceManager {
         .catch(() => undefined);
       logVoiceVerbose(`playback done: guild ${entry.guildId} channel ${entry.channelId}`);
     });
+  }
+
+  /**
+   * Process a transcript from the streaming STT session.
+   * Invokes the agent and plays the response via streaming TTS.
+   */
+  private async processStreamingTranscript(
+    entry: VoiceSessionEntry,
+    transcript: string,
+  ): Promise<void> {
+    logger.info(
+      `voice streaming: transcript received (${transcript.length} chars) guild=${entry.guildId}`,
+    );
+
+    // Use runEmbeddedPiAgent directly (voice-call pattern) — bypasses the message delivery
+    // pipeline entirely. agentCommandFromIngress routes through text channels even with
+    // deliver:false, causing responses to leak to Discord text chat.
+    // Runtime is captured at join() time to avoid "not initialized" errors during channel restarts.
+    if (!entry.pluginRuntime) {
+      logger.warn("voice streaming: plugin runtime not available, skipping transcript");
+      return;
+    }
+    const agentRuntime = entry.pluginRuntime.agent;
+    const agentId = entry.route.agentId;
+    const cfg = this.params.cfg;
+
+    const agentDir = agentRuntime.resolveAgentDir(cfg, agentId);
+    const workspaceDir = agentRuntime.resolveAgentWorkspaceDir(cfg, agentId);
+    await agentRuntime.ensureAgentWorkspace({ dir: workspaceDir });
+
+    const storePath = agentRuntime.session.resolveStorePath(cfg.session?.store, { agentId });
+    const sessionStore = agentRuntime.session.loadSessionStore(storePath);
+    const sessionKey = entry.route.sessionKey;
+
+    let sessionEntry = sessionStore[sessionKey] as
+      | { sessionId: string; updatedAt: number }
+      | undefined;
+    if (!sessionEntry) {
+      sessionEntry = { sessionId: randomUUID(), updatedAt: Date.now() };
+      sessionStore[sessionKey] = sessionEntry;
+      await agentRuntime.session.saveSessionStore(storePath, sessionStore);
+    }
+
+    const sessionFile = agentRuntime.session.resolveSessionFilePath(sessionEntry.sessionId);
+
+    // Voice needs a fast model — default to gpt-4o-mini for speed.
+    // Configurable via voice.streaming.llmModel in config.
+    const voiceStreamingCfg = this.params.discordConfig.voice?.streaming;
+    const voiceModel = voiceStreamingCfg?.llmModel ?? "openai/gpt-4o-mini";
+    const slashIndex = voiceModel.indexOf("/");
+    const provider = slashIndex === -1 ? "openai" : voiceModel.slice(0, slashIndex);
+    const model = slashIndex === -1 ? voiceModel : voiceModel.slice(slashIndex + 1);
+    const thinkLevel = "off";
+    const timeoutMs = 15_000;
+
+    const result = await agentRuntime.runEmbeddedPiAgent({
+      sessionId: sessionEntry.sessionId,
+      sessionKey,
+      messageProvider: "discord",
+      sessionFile,
+      workspaceDir,
+      config: cfg,
+      prompt: transcript,
+      provider,
+      model,
+      thinkLevel,
+      verboseLevel: "off",
+      timeoutMs,
+      runId: `voice:${entry.guildId}:${Date.now()}`,
+      lane: "voice",
+      extraSystemPrompt:
+        "You are a voice assistant in a Discord voice channel. Keep responses brief and conversational (1-3 sentences). Be natural and friendly.",
+      agentDir,
+    });
+
+    const replyText = (result.payloads ?? [])
+      .filter((p: { text?: string; isError?: boolean }) => p.text && !p.isError)
+      .map((p: { text?: string }) => p.text?.trim())
+      .filter(Boolean)
+      .join(" ")
+      .trim();
+
+    if (!replyText) {
+      logger.info(`voice streaming: agent reply empty guild=${entry.guildId}`);
+      return;
+    }
+    logger.info(`voice streaming: agent reply (${replyText.length} chars) guild=${entry.guildId}: "${replyText.slice(0, 80)}..."`);
+
+    const openaiApiKey = await this.resolveOpenAIApiKey();
+    if (!openaiApiKey) {
+      logger.warn("voice streaming: no OpenAI API key for TTS");
+      return;
+    }
+
+    const ttsConfig: StreamingTtsConfig = {
+      apiKey: openaiApiKey,
+      model: voiceStreamingCfg?.ttsModel,
+      voice: voiceStreamingCfg?.ttsVoice,
+      instructions: voiceStreamingCfg?.ttsInstructions,
+    };
+
+    const abort = new AbortController();
+    entry.streamingTtsAbort = abort;
+
+    this.enqueuePlayback(entry, async () => {
+      logger.info(`voice streaming: TTS playback starting guild=${entry.guildId}`);
+      try {
+        await playStreamingTts({
+          text: replyText,
+          player: entry.player,
+          config: ttsConfig,
+          signal: abort.signal,
+        });
+        logger.info(`voice streaming: TTS playback done guild=${entry.guildId}`);
+      } catch (err) {
+        if ((err as Error).name !== "AbortError") {
+          logger.warn(`voice streaming: TTS playback failed guild=${entry.guildId}: ${formatErrorMessage(err)}`);
+        }
+      }
+    });
+  }
+
+  /**
+   * Resolve OpenAI API key from environment.
+   */
+  private async resolveOpenAIApiKey(): Promise<string | null> {
+    return process.env.OPENAI_API_KEY ?? null;
   }
 
   private handleReceiveError(entry: VoiceSessionEntry, err: unknown) {

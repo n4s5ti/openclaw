@@ -125,6 +125,25 @@ export type DiscordVoiceAutoJoinConfig = {
   channelId: string;
 };
 
+export type DiscordVoiceStreamingConfig = {
+  /** Enable streaming voice mode using OpenAI Realtime API (default: false). */
+  enabled?: boolean;
+  /** STT model for streaming transcription (default: gpt-4o-transcribe). */
+  sttModel?: string;
+  /** Silence duration in ms before VAD considers speech ended (default: 800). */
+  silenceDurationMs?: number;
+  /** VAD threshold 0-1, higher = less sensitive (default: 0.5). */
+  vadThreshold?: number;
+  /** TTS model for streaming speech synthesis (default: gpt-4o-mini-tts). */
+  ttsModel?: string;
+  /** TTS voice (default: coral). */
+  ttsVoice?: string;
+  /** TTS style instructions (only works with gpt-4o-mini-tts). */
+  ttsInstructions?: string;
+  /** LLM model for voice responses (default: openai/gpt-4o-mini). Use provider/model format. */
+  llmModel?: string;
+};
+
 export type DiscordVoiceConfig = {
   /** Enable Discord voice channel conversations (default: true). */
   enabled?: boolean;
@@ -136,6 +155,8 @@ export type DiscordVoiceConfig = {
   decryptionFailureTolerance?: number;
   /** Optional TTS overrides for Discord voice output. */
   tts?: TtsConfig;
+  /** Streaming voice mode: real-time STT/TTS via OpenAI Realtime API for low-latency conversations. */
+  streaming?: DiscordVoiceStreamingConfig;
 };
 
 export type DiscordExecApprovalConfig = {
