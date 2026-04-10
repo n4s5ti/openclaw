@@ -8,14 +8,16 @@ import {
 } from "./app-polling.ts";
 import { scheduleChatScroll, scheduleLogsScroll } from "./app-scroll.ts";
 import type { OpenClawApp } from "./app.ts";
+import { loadAgentFiles } from "./controllers/agent-files.ts";
 import { loadAgentIdentities, loadAgentIdentity } from "./controllers/agent-identity.ts";
 import { loadAgentSkills } from "./controllers/agent-skills.ts";
 import { loadAgents } from "./controllers/agents.ts";
 import { loadChannels } from "./controllers/channels.ts";
 import { loadConfig, loadConfigSchema } from "./controllers/config.ts";
-import { loadCronJobs, loadCronRuns, loadCronStatus } from "./controllers/cron.ts";
+import { loadCronJobsPage, loadCronRuns, loadCronStatus } from "./controllers/cron.ts";
 import { loadDebug } from "./controllers/debug.ts";
 import { loadDevices } from "./controllers/devices.ts";
+import { loadDreamDiary, loadDreamingStatus } from "./controllers/dreaming.ts";
 import { loadExecApprovals } from "./controllers/exec-approvals.ts";
 import { loadLogs } from "./controllers/logs.ts";
 import { loadNodes } from "./controllers/nodes.ts";
@@ -32,6 +34,7 @@ import {
   type Tab,
 } from "./navigation.ts";
 import { saveSettings, type UiSettings } from "./storage.ts";
+import { normalizeOptionalString } from "./string-coerce.ts";
 import { startThemeTransition, type ThemeTransitionContext } from "./theme-transition.ts";
 import { resolveTheme, type ResolvedTheme, type ThemeMode, type ThemeName } from "./theme.ts";
 import type { AgentsListResult, AttentionItem } from "./types.ts";
@@ -58,12 +61,23 @@ type SettingsHost = {
   pendingGatewayUrl?: string | null;
   systemThemeCleanup?: (() => void) | null;
   pendingGatewayToken?: string | null;
+  dreamingStatusLoading: boolean;
+  dreamingStatusError: string | null;
+  dreamingStatus: import("./controllers/dreaming.js").DreamingStatus | null;
+  dreamingModeSaving: boolean;
+  dreamDiaryLoading: boolean;
+  dreamDiaryError: string | null;
+  dreamDiaryPath: string | null;
+  dreamDiaryContent: string | null;
 };
 
 export function applySettings(host: SettingsHost, next: UiSettings) {
   const normalized = {
     ...next,
-    lastActiveSessionKey: next.lastActiveSessionKey?.trim() || next.sessionKey.trim() || "main",
+    lastActiveSessionKey:
+      normalizeOptionalString(next.lastActiveSessionKey) ??
+      normalizeOptionalString(next.sessionKey) ??
+      "main",
   };
   host.settings = normalized;
   saveSettings(normalized);
@@ -78,14 +92,23 @@ export function applySettings(host: SettingsHost, next: UiSettings) {
 
 export function setLastActiveSessionKey(host: SettingsHost, next: string) {
   const trimmed = next.trim();
-  if (!trimmed) {
-    return;
-  }
-  if (host.settings.lastActiveSessionKey === trimmed) {
+  if (!trimmed || host.settings.lastActiveSessionKey === trimmed) {
     return;
   }
   applySettings(host, { ...host.settings, lastActiveSessionKey: trimmed });
 }
+
+function applySessionSelection(host: SettingsHost, session: string) {
+  host.sessionKey = session;
+  applySettings(host, {
+    ...host.settings,
+    sessionKey: session,
+    lastActiveSessionKey: session,
+  });
+}
+
+/** Set to true when the token is read from a query string (?token=) instead of a URL fragment. */
+export let warnQueryToken = false;
 
 export function applySettingsFromUrl(host: SettingsHost) {
   if (!window.location.search && !window.location.hash) {
@@ -96,17 +119,17 @@ export function applySettingsFromUrl(host: SettingsHost) {
   const hashParams = new URLSearchParams(url.hash.startsWith("#") ? url.hash.slice(1) : url.hash);
 
   const gatewayUrlRaw = params.get("gatewayUrl") ?? hashParams.get("gatewayUrl");
-  const nextGatewayUrl = gatewayUrlRaw?.trim() ?? "";
+  const nextGatewayUrl = normalizeOptionalString(gatewayUrlRaw) ?? "";
   const gatewayUrlChanged = Boolean(nextGatewayUrl && nextGatewayUrl !== host.settings.gatewayUrl);
   // Prefer fragment tokens over query tokens. Fragments avoid server-side request
   // logs and referrer leakage; query-param tokens remain a one-time legacy fallback
   // for compatibility with older deep links.
-  const tokenRaw = hashParams.get("token") ?? params.get("token");
-  const passwordRaw = params.get("password") ?? hashParams.get("password");
-  const sessionRaw = params.get("session") ?? hashParams.get("session");
-  const shouldResetSessionForToken = Boolean(
-    tokenRaw?.trim() && !sessionRaw?.trim() && !gatewayUrlChanged,
-  );
+  const queryToken = params.get("token");
+  const hashToken = hashParams.get("token");
+  const hasTokenParam = hashToken != null || queryToken != null;
+  const token = normalizeOptionalString(hashToken ?? queryToken);
+  const session = normalizeOptionalString(params.get("session") ?? hashParams.get("session"));
+  const shouldResetSessionForToken = Boolean(token && !session && !gatewayUrlChanged);
   let shouldCleanUrl = false;
 
   if (params.has("token")) {
@@ -114,8 +137,13 @@ export function applySettingsFromUrl(host: SettingsHost) {
     shouldCleanUrl = true;
   }
 
-  if (tokenRaw != null) {
-    const token = tokenRaw.trim();
+  if (hasTokenParam) {
+    if (queryToken != null) {
+      warnQueryToken = true;
+      console.warn(
+        "[openclaw] Auth token passed as query parameter (?token=). Use URL fragment instead: #token=<token>. Query parameters may appear in server logs.",
+      );
+    }
     if (token && gatewayUrlChanged) {
       host.pendingGatewayToken = token;
     } else if (token && token !== host.settings.token) {
@@ -134,35 +162,20 @@ export function applySettingsFromUrl(host: SettingsHost) {
     });
   }
 
-  if (passwordRaw != null) {
+  if (params.has("password") || hashParams.has("password")) {
     // Never hydrate password from URL params; strip only.
     params.delete("password");
     hashParams.delete("password");
     shouldCleanUrl = true;
   }
 
-  if (sessionRaw != null) {
-    const session = sessionRaw.trim();
-    if (session) {
-      host.sessionKey = session;
-      applySettings(host, {
-        ...host.settings,
-        sessionKey: session,
-        lastActiveSessionKey: session,
-      });
-    }
+  if (session) {
+    applySessionSelection(host, session);
   }
 
   if (gatewayUrlRaw != null) {
-    if (gatewayUrlChanged) {
-      host.pendingGatewayUrl = nextGatewayUrl;
-      if (!tokenRaw?.trim()) {
-        host.pendingGatewayToken = null;
-      }
-    } else {
-      host.pendingGatewayUrl = null;
-      host.pendingGatewayToken = null;
-    }
+    host.pendingGatewayUrl = gatewayUrlChanged ? nextGatewayUrl : null;
+    host.pendingGatewayToken = gatewayUrlChanged ? (token ?? null) : null;
     params.delete("gatewayUrl");
     hashParams.delete("gatewayUrl");
     shouldCleanUrl = true;
@@ -174,20 +187,21 @@ export function applySettingsFromUrl(host: SettingsHost) {
   url.search = params.toString();
   const nextHash = hashParams.toString();
   url.hash = nextHash ? `#${nextHash}` : "";
-  window.history.replaceState({}, "", url.toString());
+  updateBrowserHistory(url, true);
 }
 
 export function setTab(host: SettingsHost, next: Tab) {
   applyTabSelection(host, next, { refreshPolicy: "always", syncUrl: true });
 }
 
-export function setTheme(host: SettingsHost, next: ThemeName, context?: ThemeTransitionContext) {
-  const resolved = resolveTheme(next, host.themeMode);
-  const applyTheme = () => {
-    applySettings(host, { ...host.settings, theme: next });
-  };
+function applyThemeTransition(
+  host: SettingsHost,
+  nextTheme: ResolvedTheme,
+  applyTheme: () => void,
+  context?: ThemeTransitionContext,
+) {
   startThemeTransition({
-    nextTheme: resolved,
+    nextTheme,
     applyTheme,
     context,
     currentTheme: host.themeResolved,
@@ -195,100 +209,115 @@ export function setTheme(host: SettingsHost, next: ThemeName, context?: ThemeTra
   syncSystemThemeListener(host);
 }
 
+export function setTheme(host: SettingsHost, next: ThemeName, context?: ThemeTransitionContext) {
+  applyThemeTransition(
+    host,
+    resolveTheme(next, host.themeMode),
+    () => applySettings(host, { ...host.settings, theme: next }),
+    context,
+  );
+}
+
 export function setThemeMode(
   host: SettingsHost,
   next: ThemeMode,
   context?: ThemeTransitionContext,
 ) {
-  const resolved = resolveTheme(host.theme, next);
-  const applyMode = () => {
-    applySettings(host, { ...host.settings, themeMode: next });
-  };
-  startThemeTransition({
-    nextTheme: resolved,
-    applyTheme: applyMode,
+  applyThemeTransition(
+    host,
+    resolveTheme(host.theme, next),
+    () => applySettings(host, { ...host.settings, themeMode: next }),
     context,
-    currentTheme: host.themeResolved,
-  });
-  syncSystemThemeListener(host);
+  );
+}
+
+async function refreshAgentsTab(host: SettingsHost, app: OpenClawApp) {
+  await loadAgents(app);
+  await loadConfig(app);
+  const agentIds = host.agentsList?.agents?.map((entry) => entry.id) ?? [];
+  if (agentIds.length > 0) {
+    void loadAgentIdentities(app, agentIds);
+  }
+  const agentId =
+    host.agentsSelectedId ?? host.agentsList?.defaultId ?? host.agentsList?.agents?.[0]?.id;
+  if (!agentId) {
+    return;
+  }
+  void loadAgentIdentity(app, agentId);
+  switch (host.agentsPanel) {
+    case "files":
+      return void loadAgentFiles(app, agentId);
+    case "skills":
+      return void loadAgentSkills(app, agentId);
+    case "channels":
+      return void loadChannels(app, false);
+    case "cron":
+      return void loadCron(host);
+  }
 }
 
 export async function refreshActiveTab(host: SettingsHost) {
-  if (host.tab === "overview") {
-    await loadOverview(host);
-  }
-  if (host.tab === "channels") {
-    await loadChannelsTab(host);
-  }
-  if (host.tab === "instances") {
-    await loadPresence(host as unknown as OpenClawApp);
-  }
-  if (host.tab === "usage") {
-    await loadUsage(host as unknown as OpenClawApp);
-  }
-  if (host.tab === "sessions") {
-    await loadSessions(host as unknown as OpenClawApp);
-  }
-  if (host.tab === "cron") {
-    await loadCron(host);
-  }
-  if (host.tab === "skills") {
-    await loadSkills(host as unknown as OpenClawApp);
-  }
-  if (host.tab === "agents") {
-    await loadAgents(host as unknown as OpenClawApp);
-    await loadConfig(host as unknown as OpenClawApp);
-    const agentIds = host.agentsList?.agents?.map((entry) => entry.id) ?? [];
-    if (agentIds.length > 0) {
-      void loadAgentIdentities(host as unknown as OpenClawApp, agentIds);
-    }
-    const agentId =
-      host.agentsSelectedId ?? host.agentsList?.defaultId ?? host.agentsList?.agents?.[0]?.id;
-    if (agentId) {
-      void loadAgentIdentity(host as unknown as OpenClawApp, agentId);
-      if (host.agentsPanel === "skills") {
-        void loadAgentSkills(host as unknown as OpenClawApp, agentId);
-      }
-      if (host.agentsPanel === "channels") {
-        void loadChannels(host as unknown as OpenClawApp, false);
-      }
-      if (host.agentsPanel === "cron") {
-        void loadCron(host);
-      }
-    }
-  }
-  if (host.tab === "nodes") {
-    await loadNodes(host as unknown as OpenClawApp);
-    await loadDevices(host as unknown as OpenClawApp);
-    await loadConfig(host as unknown as OpenClawApp);
-    await loadExecApprovals(host as unknown as OpenClawApp);
-  }
-  if (host.tab === "chat") {
-    await refreshChat(host as unknown as Parameters<typeof refreshChat>[0]);
-    scheduleChatScroll(
-      host as unknown as Parameters<typeof scheduleChatScroll>[0],
-      !host.chatHasAutoScrolled,
-    );
-  }
-  if (
-    host.tab === "config" ||
-    host.tab === "communications" ||
-    host.tab === "appearance" ||
-    host.tab === "automation" ||
-    host.tab === "infrastructure" ||
-    host.tab === "aiAgents"
-  ) {
-    await loadConfigSchema(host as unknown as OpenClawApp);
-    await loadConfig(host as unknown as OpenClawApp);
-  }
-  if (host.tab === "debug") {
-    await loadDebug(host as unknown as OpenClawApp);
-    host.eventLog = host.eventLogBuffer;
-  }
-  if (host.tab === "logs") {
-    host.logsAtBottom = true;
-    await loadLogs(host as unknown as OpenClawApp, { reset: true });
-    scheduleLogsScroll(host as unknown as Parameters<typeof scheduleLogsScroll>[0], true);
+  const app = host as unknown as OpenClawApp;
+  switch (host.tab) {
+    case "config":
+    case "communications":
+    case "appearance":
+    case "automation":
+    case "infrastructure":
+    case "aiAgents":
+      await loadConfigSchema(app);
+      await loadConfig(app);
+      return;
+    case "overview":
+      await loadOverview(host);
+      return;
+    case "channels":
+      await loadChannelsTab(host);
+      return;
+    case "instances":
+      await loadPresence(app);
+      return;
+    case "usage":
+      await loadUsage(app);
+      return;
+    case "sessions":
+      await loadSessions(app);
+      return;
+    case "cron":
+      await loadCron(host);
+      return;
+    case "skills":
+      await loadSkills(app);
+      return;
+    case "agents":
+      await refreshAgentsTab(host, app);
+      return;
+    case "nodes":
+      await loadNodes(app);
+      await loadDevices(app);
+      await loadConfig(app);
+      await loadExecApprovals(app);
+      return;
+    case "dreams":
+      await loadConfig(app);
+      await Promise.all([loadDreamingStatus(app), loadDreamDiary(app)]);
+      return;
+    case "chat":
+      await refreshChat(host as unknown as Parameters<typeof refreshChat>[0]);
+      scheduleChatScroll(
+        host as unknown as Parameters<typeof scheduleChatScroll>[0],
+        !host.chatHasAutoScrolled,
+      );
+      return;
+    case "debug":
+      await loadDebug(app);
+      host.eventLog = host.eventLogBuffer;
+      return;
+    case "logs":
+      host.logsAtBottom = true;
+      await loadLogs(app, { reset: true });
+      scheduleLogsScroll(host as unknown as Parameters<typeof scheduleLogsScroll>[0], true);
+      return;
   }
 }
 
@@ -297,8 +326,9 @@ export function inferBasePath() {
     return "";
   }
   const configured = window.__OPENCLAW_CONTROL_UI_BASE_PATH__;
-  if (typeof configured === "string" && configured.trim()) {
-    return normalizeBasePath(configured);
+  const normalizedConfigured = normalizeOptionalString(configured);
+  if (normalizedConfigured) {
+    return normalizeBasePath(normalizedConfigured);
   }
   return inferBasePathFromPathname(window.location.pathname);
 }
@@ -311,16 +341,12 @@ export function syncThemeWithSettings(host: SettingsHost) {
   syncSystemThemeListener(host);
 }
 
-export function attachThemeListener(host: SettingsHost) {
-  syncSystemThemeListener(host);
-}
-
 export function detachThemeListener(host: SettingsHost) {
   host.systemThemeCleanup?.();
   host.systemThemeCleanup = null;
 }
 
-const BASE_RADII = { sm: 6, md: 10, lg: 14, xl: 20, default: 10 };
+const BASE_RADII = { sm: 6, md: 10, lg: 14, xl: 20, full: 9999, default: 10 };
 
 export function applyBorderRadius(value: number) {
   if (typeof document === "undefined") {
@@ -332,6 +358,7 @@ export function applyBorderRadius(value: number) {
   root.style.setProperty("--radius-md", `${Math.round(BASE_RADII.md * scale)}px`);
   root.style.setProperty("--radius-lg", `${Math.round(BASE_RADII.lg * scale)}px`);
   root.style.setProperty("--radius-xl", `${Math.round(BASE_RADII.xl * scale)}px`);
+  root.style.setProperty("--radius-full", `${Math.round(BASE_RADII.full * scale)}px`);
   root.style.setProperty("--radius", `${Math.round(BASE_RADII.default * scale)}px`);
 }
 
@@ -401,14 +428,9 @@ export function onPopState(host: SettingsHost) {
   }
 
   const url = new URL(window.location.href);
-  const session = url.searchParams.get("session")?.trim();
+  const session = normalizeOptionalString(url.searchParams.get("session"));
   if (session) {
-    host.sessionKey = session;
-    applySettings(host, {
-      ...host.settings,
-      sessionKey: session,
-      lastActiveSessionKey: session,
-    });
+    applySessionSelection(host, session);
   }
 
   setTabFromRoute(host, resolved);
@@ -418,15 +440,20 @@ export function setTabFromRoute(host: SettingsHost, next: Tab) {
   applyTabSelection(host, next, { refreshPolicy: "connected" });
 }
 
+function updateBrowserHistory(url: URL, replace: boolean) {
+  if (replace) {
+    return window.history.replaceState({}, "", url.toString());
+  }
+  return window.history.pushState({}, "", url.toString());
+}
+
 function applyTabSelection(
   host: SettingsHost,
   next: Tab,
   options: { refreshPolicy: "always" | "connected"; syncUrl?: boolean },
 ) {
   const prev = host.tab;
-  if (host.tab !== next) {
-    host.tab = next;
-  }
+  host.tab = next;
 
   // Cleanup chat module state when navigating away from chat
   if (prev === "chat" && next !== "chat") {
@@ -436,16 +463,12 @@ function applyTabSelection(
   if (next === "chat") {
     host.chatHasAutoScrolled = false;
   }
-  if (next === "logs") {
-    startLogsPolling(host as unknown as Parameters<typeof startLogsPolling>[0]);
-  } else {
-    stopLogsPolling(host as unknown as Parameters<typeof stopLogsPolling>[0]);
-  }
-  if (next === "debug") {
-    startDebugPolling(host as unknown as Parameters<typeof startDebugPolling>[0]);
-  } else {
-    stopDebugPolling(host as unknown as Parameters<typeof stopDebugPolling>[0]);
-  }
+  (next === "logs" ? startLogsPolling : stopLogsPolling)(
+    host as unknown as Parameters<typeof startLogsPolling>[0],
+  );
+  (next === "debug" ? startDebugPolling : stopDebugPolling)(
+    host as unknown as Parameters<typeof startDebugPolling>[0],
+  );
 
   if (options.refreshPolicy === "always" || host.connected) {
     void refreshActiveTab(host);
@@ -474,11 +497,7 @@ export function syncUrlWithTab(host: SettingsHost, tab: Tab, replace: boolean) {
     url.pathname = targetPath;
   }
 
-  if (replace) {
-    window.history.replaceState({}, "", url.toString());
-  } else {
-    window.history.pushState({}, "", url.toString());
-  }
+  updateBrowserHistory(url, replace);
 }
 
 export function syncUrlWithSessionKey(host: SettingsHost, sessionKey: string, replace: boolean) {
@@ -487,11 +506,7 @@ export function syncUrlWithSessionKey(host: SettingsHost, sessionKey: string, re
   }
   const url = new URL(window.location.href);
   url.searchParams.set("session", sessionKey);
-  if (replace) {
-    window.history.replaceState({}, "", url.toString());
-  } else {
-    window.history.pushState({}, "", url.toString());
-  }
+  updateBrowserHistory(url, replace);
 }
 
 export async function loadOverview(host: SettingsHost) {
@@ -501,7 +516,7 @@ export async function loadOverview(host: SettingsHost) {
     loadPresence(app),
     loadSessions(app),
     loadCronStatus(app),
-    loadCronJobs(app),
+    loadCronJobsPage(app),
     loadDebug(app),
     loadSkills(app),
     loadUsage(app),
@@ -635,11 +650,8 @@ function buildAttentionItems(host: OpenClawApp) {
 }
 
 export async function loadChannelsTab(host: SettingsHost) {
-  await Promise.all([
-    loadChannels(host as unknown as OpenClawApp, true),
-    loadConfigSchema(host as unknown as OpenClawApp),
-    loadConfig(host as unknown as OpenClawApp),
-  ]);
+  const app = host as unknown as OpenClawApp;
+  await Promise.all([loadChannels(app, true), loadConfigSchema(app), loadConfig(app)]);
 }
 
 export async function loadCron(host: SettingsHost) {
@@ -648,7 +660,7 @@ export async function loadCron(host: SettingsHost) {
   await Promise.all([
     loadChannels(app, false),
     loadCronStatus(app),
-    loadCronJobs(app),
+    loadCronJobsPage(app),
     loadCronRuns(app, activeCronJobId),
   ]);
 }
