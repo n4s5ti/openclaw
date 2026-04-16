@@ -847,6 +847,12 @@ importers:
         specifier: workspace:*
         version: link:../..
 
+  extensions/music:
+    dependencies:
+      '@sinclair/typebox':
+        specifier: 0.34.48
+        version: 0.34.48
+
   extensions/nextcloud-talk:
     devDependencies:
       '@openclaw/plugin-sdk':
