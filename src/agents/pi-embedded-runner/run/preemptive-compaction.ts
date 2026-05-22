@@ -1,7 +1,12 @@
-import type { AgentMessage } from "@mariozechner/pi-agent-core";
-import { estimateTokens } from "@mariozechner/pi-coding-agent";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import { estimateTokens } from "@earendil-works/pi-coding-agent";
 import { SAFETY_MARGIN, estimateMessagesTokens } from "../../compaction.js";
+import {
+  MIN_PROMPT_BUDGET_RATIO,
+  MIN_PROMPT_BUDGET_TOKENS,
+} from "../../pi-compaction-constants.js";
 import { estimateToolResultReductionPotential } from "../tool-result-truncation.js";
+import type { PreemptiveCompactionRoute } from "./preemptive-compaction.types.js";
 
 export const PREEMPTIVE_OVERFLOW_ERROR_TEXT =
   "Context overflow: prompt too large for the model (precheck).";
@@ -9,11 +14,17 @@ export const PREEMPTIVE_OVERFLOW_ERROR_TEXT =
 const ESTIMATED_CHARS_PER_TOKEN = 4;
 const TRUNCATION_ROUTE_BUFFER_TOKENS = 512;
 
-export type PreemptiveCompactionRoute =
-  | "fits"
-  | "compact_only"
-  | "truncate_tool_results_only"
-  | "compact_then_truncate";
+export type { PreemptiveCompactionRoute } from "./preemptive-compaction.types.js";
+
+export type PreemptiveCompactionDecision = {
+  route: PreemptiveCompactionRoute;
+  shouldCompact: boolean;
+  estimatedPromptTokens: number;
+  promptBudgetBeforeReserve: number;
+  overflowTokens: number;
+  toolResultReducibleChars: number;
+  effectiveReserveTokens: number;
+};
 
 export function estimatePrePromptTokens(params: {
   messages: AgentMessage[];
@@ -39,27 +50,46 @@ export function estimatePrePromptTokens(params: {
 
 export function shouldPreemptivelyCompactBeforePrompt(params: {
   messages: AgentMessage[];
+  unwindowedMessages?: AgentMessage[];
   systemPrompt?: string;
   prompt: string;
   contextTokenBudget: number;
   reserveTokens: number;
-}): {
-  route: PreemptiveCompactionRoute;
-  shouldCompact: boolean;
-  estimatedPromptTokens: number;
-  promptBudgetBeforeReserve: number;
-  overflowTokens: number;
-  toolResultReducibleChars: number;
-} {
-  const estimatedPromptTokens = estimatePrePromptTokens(params);
-  const promptBudgetBeforeReserve = Math.max(
-    1,
-    Math.floor(params.contextTokenBudget) - Math.max(0, Math.floor(params.reserveTokens)),
+  toolResultMaxChars?: number;
+}): PreemptiveCompactionDecision {
+  let messagesForPressure = params.messages;
+  let estimatedPromptTokens = estimatePrePromptTokens({
+    messages: params.messages,
+    systemPrompt: params.systemPrompt,
+    prompt: params.prompt,
+  });
+  if (params.unwindowedMessages && params.unwindowedMessages !== params.messages) {
+    const unwindowedEstimatedPromptTokens = estimatePrePromptTokens({
+      messages: params.unwindowedMessages,
+      systemPrompt: params.systemPrompt,
+      prompt: params.prompt,
+    });
+    if (unwindowedEstimatedPromptTokens > estimatedPromptTokens) {
+      estimatedPromptTokens = unwindowedEstimatedPromptTokens;
+      messagesForPressure = params.unwindowedMessages;
+    }
+  }
+  const contextTokenBudget = Math.max(1, Math.floor(params.contextTokenBudget));
+  const requestedReserveTokens = Math.max(0, Math.floor(params.reserveTokens));
+  const minPromptBudget = Math.min(
+    MIN_PROMPT_BUDGET_TOKENS,
+    Math.max(1, Math.floor(contextTokenBudget * MIN_PROMPT_BUDGET_RATIO)),
   );
+  const effectiveReserveTokens = Math.min(
+    requestedReserveTokens,
+    Math.max(0, contextTokenBudget - minPromptBudget),
+  );
+  const promptBudgetBeforeReserve = Math.max(1, contextTokenBudget - effectiveReserveTokens);
   const overflowTokens = Math.max(0, estimatedPromptTokens - promptBudgetBeforeReserve);
   const toolResultPotential = estimateToolResultReductionPotential({
-    messages: params.messages,
+    messages: messagesForPressure,
     contextWindowTokens: params.contextTokenBudget,
+    maxCharsOverride: params.toolResultMaxChars,
   });
   const overflowChars = overflowTokens * ESTIMATED_CHARS_PER_TOKEN;
   const truncationBufferChars = TRUNCATION_ROUTE_BUFFER_TOKENS * ESTIMATED_CHARS_PER_TOKEN;
@@ -86,5 +116,37 @@ export function shouldPreemptivelyCompactBeforePrompt(params: {
     promptBudgetBeforeReserve,
     overflowTokens,
     toolResultReducibleChars,
+    effectiveReserveTokens,
   };
+}
+
+export function formatPrePromptPrecheckLog(params: {
+  result: PreemptiveCompactionDecision;
+  sessionKey?: string;
+  sessionId?: string;
+  provider: string;
+  modelId: string;
+  messageCount: number;
+  unwindowedMessageCount?: number;
+  contextTokenBudget: number;
+  reserveTokens: number;
+  sessionFile?: string;
+}): string {
+  const { result } = params;
+  return (
+    `[context-overflow-precheck] pre-prompt check ` +
+    `sessionKey=${params.sessionKey ?? params.sessionId ?? "unknown"} ` +
+    `provider=${params.provider}/${params.modelId} ` +
+    `route=${result.route} ` +
+    `estimatedPromptTokens=${result.estimatedPromptTokens} ` +
+    `promptBudgetBeforeReserve=${result.promptBudgetBeforeReserve} ` +
+    `overflowTokens=${result.overflowTokens} ` +
+    `toolResultReducibleChars=${result.toolResultReducibleChars} ` +
+    `reserveTokens=${params.reserveTokens} ` +
+    `effectiveReserveTokens=${result.effectiveReserveTokens} ` +
+    `contextTokenBudget=${params.contextTokenBudget} ` +
+    `messages=${params.messageCount} ` +
+    `unwindowedMessages=${params.unwindowedMessageCount ?? params.messageCount} ` +
+    `sessionFile=${params.sessionFile}`
+  );
 }

@@ -1,62 +1,36 @@
-import type { OpenClawConfig } from "../../config/config.js";
 import { normalizeOptionalLowercaseString } from "../../shared/string-coerce.js";
-import type { SandboxBackendHandle, SandboxBackendId } from "./backend-handle.types.js";
-import type { SandboxRegistryEntry } from "./registry.js";
-import type { SandboxConfig } from "./types.js";
+import type {
+  RegisteredSandboxBackend,
+  SandboxBackendFactory,
+  SandboxBackendId,
+  SandboxBackendManager,
+  SandboxBackendRegistration,
+} from "./backend.types.js";
 
+export type {
+  CreateSandboxBackendParams,
+  SandboxBackendFactory,
+  SandboxBackendId,
+  SandboxBackendManager,
+  SandboxBackendRegistration,
+  SandboxBackendRuntimeInfo,
+} from "./backend.types.js";
 export type {
   SandboxBackendCommandParams,
   SandboxBackendCommandResult,
   SandboxBackendExecSpec,
   SandboxBackendHandle,
-  SandboxBackendId,
-  SandboxFsBridgeContext,
 } from "./backend-handle.types.js";
 
-export type SandboxBackendRuntimeInfo = {
-  running: boolean;
-  actualConfigLabel?: string;
-  configLabelMatch: boolean;
-};
+const SANDBOX_BACKEND_FACTORIES_STATE_KEY = Symbol.for("openclaw.sandboxBackendFactories");
 
-export type SandboxBackendManager = {
-  describeRuntime(params: {
-    entry: SandboxRegistryEntry;
-    config: OpenClawConfig;
-    agentId?: string;
-  }): Promise<SandboxBackendRuntimeInfo>;
-  removeRuntime(params: {
-    entry: SandboxRegistryEntry;
-    config: OpenClawConfig;
-    agentId?: string;
-  }): Promise<void>;
-};
-
-export type CreateSandboxBackendParams = {
-  sessionKey: string;
-  scopeKey: string;
-  workspaceDir: string;
-  agentWorkspaceDir: string;
-  cfg: SandboxConfig;
-};
-
-export type SandboxBackendFactory = (
-  params: CreateSandboxBackendParams,
-) => Promise<SandboxBackendHandle>;
-
-export type SandboxBackendRegistration =
-  | SandboxBackendFactory
-  | {
-      factory: SandboxBackendFactory;
-      manager?: SandboxBackendManager;
-    };
-
-type RegisteredSandboxBackend = {
-  factory: SandboxBackendFactory;
-  manager?: SandboxBackendManager;
-};
-
-const SANDBOX_BACKEND_FACTORIES = new Map<SandboxBackendId, RegisteredSandboxBackend>();
+function getSandboxBackendFactories(): Map<SandboxBackendId, RegisteredSandboxBackend> {
+  const globalStore = globalThis as typeof globalThis & {
+    [SANDBOX_BACKEND_FACTORIES_STATE_KEY]?: Map<SandboxBackendId, RegisteredSandboxBackend>;
+  };
+  globalStore[SANDBOX_BACKEND_FACTORIES_STATE_KEY] ??= new Map();
+  return globalStore[SANDBOX_BACKEND_FACTORIES_STATE_KEY];
+}
 
 function normalizeSandboxBackendId(id: string): SandboxBackendId {
   const normalized = normalizeOptionalLowercaseString(id);
@@ -72,23 +46,25 @@ export function registerSandboxBackend(
 ): () => void {
   const normalizedId = normalizeSandboxBackendId(id);
   const resolved = typeof registration === "function" ? { factory: registration } : registration;
-  const previous = SANDBOX_BACKEND_FACTORIES.get(normalizedId);
-  SANDBOX_BACKEND_FACTORIES.set(normalizedId, resolved);
+  const factories = getSandboxBackendFactories();
+  const previous = factories.get(normalizedId);
+  factories.set(normalizedId, resolved);
   return () => {
+    const currentFactories = getSandboxBackendFactories();
     if (previous) {
-      SANDBOX_BACKEND_FACTORIES.set(normalizedId, previous);
+      currentFactories.set(normalizedId, previous);
       return;
     }
-    SANDBOX_BACKEND_FACTORIES.delete(normalizedId);
+    currentFactories.delete(normalizedId);
   };
 }
 
 export function getSandboxBackendFactory(id: string): SandboxBackendFactory | null {
-  return SANDBOX_BACKEND_FACTORIES.get(normalizeSandboxBackendId(id))?.factory ?? null;
+  return getSandboxBackendFactories().get(normalizeSandboxBackendId(id))?.factory ?? null;
 }
 
 export function getSandboxBackendManager(id: string): SandboxBackendManager | null {
-  return SANDBOX_BACKEND_FACTORIES.get(normalizeSandboxBackendId(id))?.manager ?? null;
+  return getSandboxBackendFactories().get(normalizeSandboxBackendId(id))?.manager ?? null;
 }
 
 export function requireSandboxBackendFactory(id: string): SandboxBackendFactory {

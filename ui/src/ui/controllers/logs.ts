@@ -54,8 +54,8 @@ export function parseLogLine(line: string): LogEntry {
   try {
     const obj = JSON.parse(line) as Record<string, unknown>;
     const meta =
-      obj && typeof obj._meta === "object" && obj._meta !== null
-        ? (obj._meta as Record<string, unknown>)
+      obj && typeof obj["_meta"] === "object" && obj["_meta"] !== null
+        ? (obj["_meta"] as Record<string, unknown>)
         : null;
     const time =
       typeof obj.time === "string" ? obj.time : typeof meta?.date === "string" ? meta?.date : null;
@@ -124,7 +124,7 @@ export async function loadLogs(state: LogsState, opts?: { reset?: boolean; quiet
       ? payload.lines.filter((line) => typeof line === "string")
       : [];
     const entries = lines.map(parseLogLine);
-    const shouldReset = Boolean(opts?.reset || payload.reset || state.logsCursor == null);
+    const shouldReset = opts?.reset || payload.reset || state.logsCursor == null;
     state.logsEntries = shouldReset
       ? entries
       : [...state.logsEntries, ...entries].slice(-LOG_BUFFER_LIMIT);

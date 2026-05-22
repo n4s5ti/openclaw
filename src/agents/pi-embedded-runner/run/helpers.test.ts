@@ -1,6 +1,11 @@
-import type { AssistantMessage } from "@mariozechner/pi-ai";
+import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
-import { resolveFinalAssistantVisibleText } from "./helpers.js";
+import { createUsageAccumulator } from "../usage-accumulator.js";
+import {
+  buildErrorAgentMeta,
+  resolveFinalAssistantRawText,
+  resolveFinalAssistantVisibleText,
+} from "./helpers.js";
 
 function makeAssistantMessage(
   content: AssistantMessage["content"],
@@ -59,5 +64,35 @@ describe("resolveFinalAssistantVisibleText", () => {
     ]);
 
     expect(resolveFinalAssistantVisibleText(lastAssistant)).toBeUndefined();
+  });
+
+  it("preserves raw final answer text without visible-text sanitization", () => {
+    const lastAssistant = makeAssistantMessage([
+      {
+        type: "text",
+        text: "<final>keep this</final>",
+        textSignature: JSON.stringify({ v: 1, id: "item_final", phase: "final_answer" }),
+      },
+    ]);
+
+    expect(resolveFinalAssistantRawText(lastAssistant)).toBe("<final>keep this</final>");
+  });
+});
+
+describe("buildErrorAgentMeta", () => {
+  it("preserves active session file for error exits after transcript rotation", () => {
+    expect(
+      buildErrorAgentMeta({
+        sessionId: "session-rotated",
+        sessionFile: "/tmp/session-rotated.jsonl",
+        provider: "anthropic",
+        model: "claude-opus-4-6",
+        usageAccumulator: createUsageAccumulator(),
+        lastRunPromptUsage: undefined,
+      }),
+    ).toMatchObject({
+      sessionId: "session-rotated",
+      sessionFile: "/tmp/session-rotated.jsonl",
+    });
   });
 });

@@ -96,6 +96,38 @@ describe("wrapToolWorkspaceRootGuardWithOptions", () => {
     });
   });
 
+  it("does not remap malformed file:// container workspace paths", async () => {
+    const { tool } = createToolHarness();
+    const wrapped = wrapToolWorkspaceRootGuardWithOptions(tool, root, {
+      containerWorkdir: "/workspace",
+    });
+
+    await wrapped.execute("tc-malformed-file-url", { path: "file:///workspace/%E0%A4%A" });
+
+    expect(mocks.assertSandboxPath).toHaveBeenCalledWith({
+      filePath: "file:///workspace/%E0%A4%A",
+      cwd: root,
+      root,
+    });
+  });
+
+  it("does not remap file:// container workspace paths with encoded separators", async () => {
+    const { tool } = createToolHarness();
+    const wrapped = wrapToolWorkspaceRootGuardWithOptions(tool, root, {
+      containerWorkdir: "/workspace",
+    });
+
+    await wrapped.execute("tc-encoded-separator-file-url", {
+      path: "file:///workspace/%2FREADME.md",
+    });
+
+    expect(mocks.assertSandboxPath).toHaveBeenCalledWith({
+      filePath: "file:///workspace/%2FREADME.md",
+      cwd: root,
+      root,
+    });
+  });
+
   it("maps @-prefixed container workspace paths to host workspace root", async () => {
     const { tool } = createToolHarness();
     const wrapped = wrapToolWorkspaceRootGuardWithOptions(tool, root, {
@@ -138,6 +170,40 @@ describe("wrapToolWorkspaceRootGuardWithOptions", () => {
       filePath: "/workspace-two/secret.txt",
       cwd: root,
       root,
+    });
+  });
+
+  it("maps additional container mounts to their own guarded host roots", async () => {
+    const { tool } = createToolHarness();
+    const agentRoot = "/tmp/agent-root";
+    const wrapped = wrapToolWorkspaceRootGuardWithOptions(tool, root, {
+      additionalContainerMounts: [{ containerRoot: "/agent", hostRoot: agentRoot }],
+      containerWorkdir: "/workspace",
+    });
+
+    await wrapped.execute("tc-agent-mount", { path: "/agent/docs/readme.md" });
+
+    expect(mocks.assertSandboxPath).toHaveBeenCalledWith({
+      filePath: path.resolve(agentRoot, "docs", "readme.md"),
+      cwd: agentRoot,
+      root: agentRoot,
+    });
+  });
+
+  it("maps file URLs under additional container mounts", async () => {
+    const { tool } = createToolHarness();
+    const agentRoot = "/tmp/agent-root";
+    const wrapped = wrapToolWorkspaceRootGuardWithOptions(tool, root, {
+      additionalContainerMounts: [{ containerRoot: "/agent", hostRoot: agentRoot }],
+      containerWorkdir: "/workspace",
+    });
+
+    await wrapped.execute("tc-agent-file-url", { path: "file:///agent/docs/readme.md" });
+
+    expect(mocks.assertSandboxPath).toHaveBeenCalledWith({
+      filePath: path.resolve(agentRoot, "docs", "readme.md"),
+      cwd: agentRoot,
+      root: agentRoot,
     });
   });
 
