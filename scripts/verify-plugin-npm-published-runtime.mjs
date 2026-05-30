@@ -188,21 +188,45 @@ export function collectPluginNpmPublishedRuntimeErrors(params) {
   return errors;
 }
 
+export function resolveNpmPackFilename(output) {
+  const filename = output
+    .split(/\r?\n/u)
+    .findLast((line) => line.trim().length > 0)
+    ?.trim();
+  if (typeof filename !== "string" || !filename.endsWith(".tgz")) {
+    throw new Error(`npm pack did not report a tarball filename`);
+  }
+  return filename;
+}
+
 function npmPack(spec, destinationDir) {
   const output = execFileSync(
     "npm",
-    ["pack", spec, "--json", "--ignore-scripts", "--pack-destination", destinationDir],
+    ["pack", spec, "--ignore-scripts", "--pack-destination", destinationDir],
     {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
     },
   );
-  const rows = JSON.parse(output);
-  const filename = rows?.[0]?.filename;
-  if (typeof filename !== "string" || !filename) {
-    throw new Error(`npm pack ${spec} did not report a tarball filename`);
-  }
+  const filename = resolveNpmPackFilename(output);
   return path.isAbsolute(filename) ? filename : path.join(destinationDir, filename);
+}
+
+export function parseNpmReadmeMetadata(raw) {
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return "";
+  }
+  return typeof parsed === "string" ? parsed.trim() : "";
+}
+
+function npmViewReadme(spec) {
+  return execFileSync("npm", ["view", spec, "readme", "--json", "--prefer-online"], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
 }
 
 function sleep(ms) {
@@ -224,6 +248,36 @@ async function packPublishedPackage(spec, destinationDir) {
         );
         await sleep(delayMs);
       }
+    }
+  }
+  throw lastError;
+}
+
+async function verifyPublishedPackageReadme(spec) {
+  const attempts = Number.parseInt(
+    process.env.OPENCLAW_PLUGIN_NPM_README_VERIFY_ATTEMPTS ?? "6",
+    10,
+  );
+  const delayMs = Number.parseInt(
+    process.env.OPENCLAW_PLUGIN_NPM_README_VERIFY_DELAY_MS ?? "10000",
+    10,
+  );
+  let lastError;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      const readme = parseNpmReadmeMetadata(npmViewReadme(spec));
+      if (readme) {
+        return readme;
+      }
+      lastError = new Error(`npm view ${spec} readme returned empty metadata`);
+    } catch (error) {
+      lastError = error;
+    }
+    if (attempt < attempts) {
+      console.error(
+        `npm readme metadata for ${spec} not ready (attempt ${attempt}/${attempts}); retrying in ${delayMs}ms...`,
+      );
+      await sleep(delayMs);
     }
   }
   throw lastError;
@@ -266,10 +320,12 @@ export async function verifyPublishedPluginRuntime(spec) {
     if (errors.length > 0) {
       throw new Error(errors.join("\n"));
     }
+    const readme = await verifyPublishedPackageReadme(spec);
     return {
       packageName: packedPackage.packageJson.name,
       version: packedPackage.packageJson.version,
       fileCount: packedPackage.files.length,
+      readmeLength: readme.length,
     };
   } finally {
     fs.rmSync(workingDir, { force: true, recursive: true });
@@ -283,7 +339,7 @@ async function main(argv) {
   }
   const result = await verifyPublishedPluginRuntime(spec);
   console.log(
-    `plugin-npm-published-runtime-check: ${result.packageName}@${result.version} OK (${result.fileCount} files)`,
+    `plugin-npm-published-runtime-check: ${result.packageName}@${result.version} OK (${result.fileCount} files, ${result.readmeLength} readme chars)`,
   );
 }
 

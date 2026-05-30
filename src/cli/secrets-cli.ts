@@ -1,10 +1,10 @@
 import type { Command } from "commander";
+import { formatDocsLink } from "../../packages/terminal-core/src/links.js";
+import { theme } from "../../packages/terminal-core/src/theme.js";
 import { danger } from "../globals.js";
 import { formatErrorMessage } from "../infra/errors.js";
 import { defaultRuntime } from "../runtime.js";
 import type { SecretsApplyPlan } from "../secrets/plan.js";
-import { formatDocsLink } from "../terminal/links.js";
-import { theme } from "../terminal/theme.js";
 import { formatCliCommand } from "./command-format.js";
 import { formatGatewayCommandFailure } from "./error-format.js";
 import { addGatewayClientOptions, callGatewayFromCli, type GatewayRpcOpts } from "./gateway-rpc.js";
@@ -181,11 +181,15 @@ export function registerSecretsCli(program: Command): void {
           const { writeFileSync } = await import("node:fs");
           writeFileSync(opts.planOut, `${JSON.stringify(configured.plan, null, 2)}\n`, "utf8");
         }
+
+        let shouldApply = Boolean(opts.apply || opts.yes);
         if (opts.json) {
-          defaultRuntime.writeJson({
-            plan: configured.plan,
-            preflight: configured.preflight,
-          });
+          if (!shouldApply) {
+            defaultRuntime.writeJson({
+              plan: configured.plan,
+              preflight: configured.preflight,
+            });
+          }
         } else {
           defaultRuntime.log(
             `Preflight: changed=${configured.preflight.changed}, files=${configured.preflight.changedFiles.length}, warnings=${configured.preflight.warningCount}.`,
@@ -213,7 +217,6 @@ export function registerSecretsCli(program: Command): void {
           }
         }
 
-        let shouldApply = Boolean(opts.apply);
         if (!shouldApply && !opts.json) {
           const { confirm } = await import("@clack/prompts");
           const approved = await confirm({
@@ -225,7 +228,12 @@ export function registerSecretsCli(program: Command): void {
           }
         }
         if (shouldApply) {
-          const needsIrreversiblePrompt = Boolean(opts.apply);
+          // Show the irreversibility warning whenever we are about to apply,
+          // including when the user opted in through the interactive "Apply
+          // this plan now?" confirm. Previously this checked opts.apply, so the
+          // one-way-migration warning was silently skipped on the interactive
+          // path (only --apply surfaced it). See #83883.
+          const needsIrreversiblePrompt = shouldApply;
           if (needsIrreversiblePrompt && !opts.yes && !opts.json) {
             const { confirm } = await import("@clack/prompts");
             const confirmed = await confirm({
